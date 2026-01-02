@@ -1,0 +1,31 @@
+# RAG 职业课程生成系统依赖 (Linux/GPU 优化)
+
+# 深度学习框架 (CUDA 支持)
+# 安装时请使用: pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.5.0
+
+# LangChain 生态
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-anthropic>=0.3.0
+
+# LLM 客户端 (支持智谱AI等OpenAI兼容接口)
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# 向量数据库
+chromadb>=0.6.0
+
+# 文档解析
+pypdf>=5.0.0
+tiktoken>=0.8.0
+
+# Embedding 模型 (GPU 加速)
+sentence-transformers>=3.0.0
+
+# 日志与进度显示
+colorama>=0.4.6
+tqdm>=4.67.0
+
+# 数据验证
+pydantic>=2.10.0
