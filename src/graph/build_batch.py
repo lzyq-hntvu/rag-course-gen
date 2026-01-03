@@ -30,6 +30,7 @@ from src.graph import (
     RelationType,
     ExperienceLevel,
     SkillComplexity,
+    GraphEdge,
     entities_to_schema,
 )
 from src.graph.loader import JobDataLoader, load_job_records
@@ -276,71 +277,144 @@ def visualize_filtered(
 def build_batch(
     num_records: int = 50,
     use_priority: bool = True,
+    security_filter: bool = False,
     save_path: Optional[str] = None,
 ) -> VocationalGraphBuilder:
     """
-    批量构建图谱
+    批量构建图谱（两阶段串行流程：国标骨架 → JD抽取）
 
     Args:
         num_records: 处理的JD数量
         use_priority: 是否使用优先技术岗位
+        security_filter: 是否启用安全领域关键词过滤
         save_path: 图谱保存路径
 
     Returns:
         VocationalGraphBuilder: 构建好的图谱
     """
-    print(f"批量构建职教能力图谱 ({num_records}条JD)")
-    print("=" * 60)
+    print(f"批量构建职教能力图谱 ({num_records}条JD) - 两阶段串行流程")
+    print("=" * 70)
 
-    # 1. 加载数据
-    print(f"\n[1/4] 加载JD数据...")
-    loader = JobDataLoader()
-    job_records = load_job_records(count=num_records, use_priority=use_priority)
-    print(f"  - 成功加载: {len(job_records)}条JD")
-
-    # 2. 初始化抽取器和构建器
-    print(f"\n[2/4] 初始化LLM抽取器...")
     extractor = EntityExtractor()
     builder = VocationalGraphBuilder()
-    print(f"  - 模型: {extractor.model}")
 
-    # 3. 批量抽取
-    print(f"\n[3/4] 批量抽取实体和关系...")
+    # ================================================================
+    # 阶段1：提取国标骨架（构建标准任务库）
+    # ================================================================
+    print(f"\n[阶段1/2] 提取国标骨架...")
+    print("-" * 70)
+
+    standard_file = project_root / "data" / "mock" / "sample_standard.txt"
+    if not standard_file.exists():
+        print(f"  警告: 国标文件不存在: {standard_file}")
+        print(f"  将跳过国标骨架提取，使用无约束抽取模式")
+        candidate_task_names = []
+    else:
+        with open(standard_file, "r", encoding="utf-8") as f:
+            standard_text = f.read()
+
+        print(f"  - 正在从国标文件提取标准任务...")
+        try:
+            standard_result = extractor.extract(
+                standard_text,
+                source_document="national_standard",
+                document_type="standard"
+            )
+            standard_tasks, _, _, _, _ = entities_to_schema(standard_result)
+
+            # 先将国标任务加入图谱
+            builder.add_entities_from_extractor(standard_tasks, [], [], [], [])
+
+            candidate_task_names = [task.name for task in standard_tasks]
+            print(f"  - 成功提取 {len(candidate_task_names)} 个标准任务（骨架）")
+            for task_name in candidate_task_names[:5]:
+                print(f"    · {task_name}")
+            if len(candidate_task_names) > 5:
+                print(f"    ... 等共 {len(candidate_task_names)} 个任务")
+        except Exception as e:
+            print(f"  - 国标抽取失败: {e}")
+            print(f"  将使用无约束抽取模式")
+            candidate_task_names = []
+
+    # ================================================================
+    # 阶段2：用骨架约束抽取 JD
+    # ================================================================
+    print(f"\n[阶段2/2] 用骨架约束抽取 JD...")
+    print("-" * 70)
+
+    # 加载 JD 数据
+    print(f"\n  步骤2.1: 加载 JD 数据...")
+    job_records = load_job_records(
+        count=num_records,
+        use_priority=use_priority,
+        security_filter=security_filter,
+        min_records=num_records // 2,
+    )
+    print(f"    - 成功加载: {len(job_records)}条JD")
+
+    # 批量抽取
+    print(f"\n  步骤2.2: 批量抽取 JD（使用国标骨架约束）...")
     success_count = 0
     fail_count = 0
 
     for i, record in enumerate(job_records):
-        print(f"  - 处理 [{i+1}/{len(job_records)}]: {record.position_name}")
+        print(f"    - 处理 [{i+1}/{len(job_records)}]: {record.position_name}")
 
         try:
             result = extractor.extract(
                 record.to_text(),
                 source_document=f"{record.source_file}_{i}",
-                document_type="jd"
+                document_type="jd",
+                candidate_tasks=candidate_task_names if candidate_task_names else None,
             )
-            standard_tasks, real_projects, action_skills, tools, edges = entities_to_schema(result)
-            builder.add_entities_from_extractor(standard_tasks, real_projects, action_skills, tools, edges)
+            # 解析抽取结果
+            # 获取骨架任务的 name_to_id 映射
+            skeleton_task_name_to_id = {}
+            for node in builder.graph.nodes(data=True):
+                if node[1].get("entity_type") == "standard_task":
+                    skeleton_task_name_to_id[node[1].get("name")] = node[0]
+
+            standard_tasks, real_projects, action_skills, tools, edges = entities_to_schema(
+                result,
+                external_name_to_id=skeleton_task_name_to_id
+            )
+
+            # 调试：检查 LLM 是否创建了 maps_to 关系
+            maps_to_count = sum(1 for e in edges if e.relation_type == RelationType.MAPS_TO)
+            if len(standard_tasks) > 0 or maps_to_count > 0:
+                print(f"      [调试] JD创建了{len(standard_tasks)}个标准任务, {maps_to_count}个映射关系")
+                for task in standard_tasks[:3]:
+                    print(f"        - {task.name}")
+
+            # 过滤掉 JD 自创的标准任务（只保留骨架任务）
+            # 所有边已经正确指向骨架任务（通过 external_name_to_id），直接保留
+            valid_edges = edges
+
+            # 只添加 real_projects, action_skills, tools（不接受 JD 创建的新 standard_tasks）
+            builder.add_entities_from_extractor(
+                [], real_projects, action_skills, tools, valid_edges
+            )
             success_count += 1
-            print(f"    成功: {len(action_skills)}个技能, {len(tools)}个工具")
+            print(f"      成功: {len(action_skills)}个技能, {len(tools)}个工具")
         except Exception as e:
             fail_count += 1
-            print(f"    跳过: {e}")
+            print(f"      跳过: {e}")
             continue
 
-    print(f"\n  - 抽取完成: 成功{success_count}条, 失败{fail_count}条")
+    print(f"\n    - 抽取完成: 成功{success_count}条, 失败{fail_count}条")
 
-    # 4. 保存图谱
+    # 保存图谱
     if save_path:
         builder.save(save_path)
-        print(f"  - 图谱已保存到: {save_path}")
+        print(f"\n  - 图谱已保存到: {save_path}")
 
     return builder
 
 
 def main():
     """主函数"""
-    # 构建图谱
-    builder = build_batch(num_records=50, use_priority=True)
+    # 构建图谱（启用安全领域过滤）
+    builder = build_batch(num_records=50, use_priority=True, security_filter=True)
 
     # 打印统计信息
     stats = builder.get_statistics()

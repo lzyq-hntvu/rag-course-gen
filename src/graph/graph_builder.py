@@ -177,6 +177,20 @@ class VocationalGraphBuilder:
             if self.graph.nodes[node_id]["entity_type"] == entity_type.value
         ]
 
+    def get_node_by_id(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """
+        根据ID获取节点
+
+        Args:
+            node_id: 节点ID
+
+        Returns:
+            Optional[Dict]: 节点数据，如果不存在则返回None
+        """
+        if node_id in self.graph:
+            return self.graph.nodes[node_id]
+        return None
+
     def get_neighbors(
         self,
         node_id: str,

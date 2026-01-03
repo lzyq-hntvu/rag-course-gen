@@ -464,6 +464,7 @@ class EntityExtractor:
         text: str,
         source_document: str = "unknown",
         document_type: str = "jd",
+        candidate_tasks: Optional[List[str]] = None,
     ) -> ExtractedEntities:
         """
         从文本中抽取实体和关系
@@ -472,13 +473,41 @@ class EntityExtractor:
             text: 待抽取的文本内容
             source_document: 来源文档标识
             document_type: 文档类型（"jd" 或 "standard"）
+            candidate_tasks: 候选标准任务列表（用于约束 JD 抽取时的映射关系）
 
         Returns:
             ExtractedEntities: 抽取结果
         """
         # 构建消息
+        system_prompt = self.system_prompt
+
+        # 如果提供了候选任务列表，在系统提示中注入约束
+        if candidate_tasks and document_type == "jd":
+            task_list = "\n".join(f"  - {task}" for task in candidate_tasks)
+            constraint = f"""
+
+## 【重要约束】国标任务骨架约束
+
+你在抽取 JD 时，必须遵循以下规则：
+
+1. **优先映射**：抽取的 Action_Skill 的 maps_to 关系必须优先指向以下已有的国标任务：
+
+{task_list}
+
+2. **命名规范**：创建标准任务时，必须使用上述列表中的确切名称，不要自行创造类似名称。
+   - 正确：Action_Skill "配置防火墙规则" maps_to "防火墙配置"
+   - 错误：Action_Skill "配置防火墙规则" maps_to "配置防火墙" （不在列表中）
+
+3. **泛化匹配**：当 JD 中的技能涉及某个领域时，将其映射到对应的国标任务。
+   - JD技能："配置华为USG6000防火墙" → 映射到 → "防火墙配置"
+   - JD技能："部署入侵检测系统" → 映射到 → "入侵检测与防御"
+
+4. **仅在无匹配时创建**：只有当上述列表中完全不存在相关任务时，才允许创建新的 Standard_Task。
+"""
+            system_prompt = self.system_prompt + constraint
+
         messages = [
-            {"role": "system", "content": self.system_prompt}
+            {"role": "system", "content": system_prompt}
         ]
 
         # 添加Few-Shot示例
@@ -492,11 +521,65 @@ class EntityExtractor:
         task_prompt = f"""请从以下{"招聘需求（JD）" if document_type == "jd" else "国家职业标准"}文本中抽取职教能力图谱的实体和关系。
 
 {text}
+"""
+
+        # 如果有候选任务约束，添加到任务提示中
+        if candidate_tasks and document_type == "jd":
+            task_list = "\n".join(f"  - {task}" for task in candidate_tasks)
+            task_prompt += f"""
+
+## 【核心要求】必须创建完整的图谱结构！
+
+你必须创建以下三类实体和关系：
+
+1. **Real_Project（真实项目）**：从JD中提取1-3个主要工作项目
+2. **Action_Skill（行动技能）**：从JD中提取具体技能要求
+3. **Tool（工具）**：从JD中提取使用的工具/技术
+4. **关系**：必须创建三种类型的关系
+   - composed_of: Real_Project -> Action_Skill（项目由哪些技能组成）
+   - maps_to: Action_Skill -> Standard_Task（技能映射到国标任务）
+   - operates: Action_Skill -> Tool（技能使用什么工具）
+
+可用的标准任务列表（maps_to目标）：
+{task_list}
+
+完整示例：
+{{
+  "real_projects": [
+    {{"name": "某公司网络安全改造项目", "experience_level": "junior"}}
+  ],
+  "action_skills": [
+    {{"name": "配置防火墙", "complexity": "medium"}},
+    {{"name": "使用Python开发脚本", "complexity": "medium"}}
+  ],
+  "tools": [
+    {{"name": "Python"}},
+    {{"name": "防火墙"}}
+  ],
+  "relations": [
+    {{"source": "某公司网络安全改造项目", "target": "配置防火墙", "relation": "composed_of"}},
+    {{"source": "某公司网络安全改造项目", "target": "使用Python开发脚本", "relation": "composed_of"}},
+    {{"source": "配置防火墙", "target": "防火墙配置", "relation": "maps_to"}},
+    {{"source": "使用Python开发脚本", "target": "设备配置调试", "relation": "maps_to"}},
+    {{"source": "配置防火墙", "target": "防火墙", "relation": "operates"}},
+    {{"source": "使用Python开发脚本", "target": "Python", "relation": "operates"}}
+  ]
+}}
+
+**重要**：
+1. 必须创建 real_projects、action_skills、tools 三种实体
+2. 必须创建 composed_of、maps_to、operates 三种关系
+3. maps_to 的目标必须从上述列表中选择
+4. 不要创建新的 standard_tasks
+"""
+
+        task_prompt += """
 
 请严格按照JSON格式输出，确保所有实体和关系的name字段能够相互匹配。注意：
 1. 忽略薪资、福利等非技能信息
 2. 将具体版本泛化（如"Python 2.7"改为"Python"）
-3. 专注于技术能力和技能要求"""
+3. 专注于技术能力和技能要求
+4. 必须创建完整的实体和关系（projects、skills、tools及它们之间的关系）"""
         messages.append({"role": "user", "content": task_prompt})
 
         # 调用LLM
@@ -506,6 +589,7 @@ class EntityExtractor:
                 messages=messages,
                 temperature=0.0,
                 response_format={"type": "json_object"},  # 强制JSON输出
+                max_tokens=4096,  # 确保输出不被截断
             )
             result_text = response.choices[0].message.content.strip()
 
@@ -560,12 +644,14 @@ class EntityExtractor:
 # ============================================================================
 def entities_to_schema(
     extracted: ExtractedEntities,
+    external_name_to_id: Dict[str, str] = None,
 ) -> tuple[list[StandardTask], list[RealProject], list[ActionSkill], list[Tool], list[GraphEdge]]:
     """
     将抽取结果转换为Schema定义的实体和边
 
     Args:
         extracted: 抽取结果
+        external_name_to_id: 外部实体名称到ID的映射（用于处理骨架任务等外部实体）
 
     Returns:
         (standard_tasks, real_projects, action_skills, tools, edges)
@@ -577,6 +663,10 @@ def entities_to_schema(
     tools = []
 
     name_to_id = {}
+
+    # 合并外部实体映射
+    if external_name_to_id:
+        name_to_id.update(external_name_to_id)
 
     # 转换StandardTask
     for task_data in extracted.standard_tasks:
