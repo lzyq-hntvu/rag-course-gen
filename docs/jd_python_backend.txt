@@ -1,0 +1,28 @@
+职位：Python后端开发工程师
+
+岗位职责：
+1. 使用Python开发Web应用，参与Web后端系统开发
+2. 配置Flask/Django框架进行项目开发
+3. 设计数据库结构，使用MySQL/PostgreSQL数据库
+4. 配置Linux系统，负责系统运维管理
+5. 使用Git/SVN进行版本控制
+
+技能要求：
+1. 熟练掌握Python编程语言
+2. 精通Flask/Django等Web框架
+3. 熟悉MySQL、PostgreSQL等数据库
+4. 熟悉Linux系统操作
+5. 熟悉Git/SVN版本控制工具
+6. 了解Nginx/Apache服务器配置
+
+项目经验：
+1. 参与企业运维平台系统开发
+2. 负责产品Web后端系统开发
+3. 参与ERP系统二次开发项目
+4. 负责Python Web应用开发项目
+
+其他要求：
+1. 具备良好的沟通能力
+2. 有Web前端开发经验优先
+3. 熟悉HTML5、JavaScript、jQuery优先
+4. 了解JSON数据格式处理

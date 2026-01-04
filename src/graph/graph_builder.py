@@ -259,6 +259,10 @@ class VocationalGraphBuilder:
                 if d.get("relation_type") in relation_values
             ])
 
+        # Check if both nodes are in the subgraph
+        if source_id not in subgraph or target_id not in subgraph:
+            return None
+
         try:
             return nx.shortest_path(subgraph, source_id, target_id)
         except nx.NetworkXNoPath:

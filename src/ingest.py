@@ -5,8 +5,9 @@ RAG 职业课程生成系统 - 数据入库脚本
 功能:
 1. 读取 docs/ 目录下所有文件
 2. 文档切分
-3. 向量化存储
-4. 元数据管理
+3. 实体链接（使用知识图谱）
+4. 向量化存储
+5. 元数据管理
 """
 
 import os
@@ -30,10 +31,67 @@ from langchain_community.document_loaders import (
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
+from sentence_transformers import SentenceTransformer
+
+# Graph-related imports
+from src.graph.graph_builder import VocationalGraphBuilder
+from src.graph.chunk_entity_linker import ChunkEntityLinker
 
 # 初始化 colorama
 colorama.init()
+
+
+class LocalEmbeddings(Embeddings):
+    """本地 Embedding 包装类，避免网络请求"""
+
+    def __init__(self, model_name: str, device: str = "cuda"):
+        self.model_name = model_name
+        self.device = device
+        self.client = None
+
+    def _load_model(self):
+        """延迟加载模型"""
+        if self.client is None:
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # 尝试从本地缓存加载
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+            local_model_dir = cache_dir / f"models--{self.model_name.replace('/', '--')}"
+
+            if local_model_dir.exists():
+                # 找到 snapshot 目录
+                snapshot_dir = None
+                for d in local_model_dir.iterdir():
+                    if d.is_dir() and "snapshots" in str(d):
+                        # 获取实际的 snapshot 目录
+                        snapshots = list(d.glob("*/"))
+                        if snapshots:
+                            snapshot_dir = snapshots[0]
+                            break
+
+                if snapshot_dir:
+                    print_info(f"从本地缓存加载: {snapshot_dir}")
+                    self.client = SentenceTransformer(str(snapshot_dir), device=self.device)
+                    print_success("模型加载完成")
+                    return
+
+            # 回退到在线加载（会使用缓存）
+            print_info(f"加载模型: {self.model_name}")
+            self.client = SentenceTransformer(self.model_name, device=self.device)
+            print_success("模型加载完成")
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """嵌入文档"""
+        self._load_model()
+        return self.client.encode(texts, normalize_embeddings=True).tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        """嵌入查询"""
+        self._load_model()
+        return self.client.encode(text, normalize_embeddings=True).tolist()
 
 # 配置
 SCRIPT_DIR = Path(__file__).parent
@@ -41,6 +99,7 @@ BASE_DIR = SCRIPT_DIR.parent
 DOCS_DIR = BASE_DIR / "docs"
 DATA_DIR = BASE_DIR / "data"
 CHROMA_PERSIST_DIR = DATA_DIR / "chroma_db"
+GRAPH_PATH = DATA_DIR / "output" / "graph.pkl"
 
 # 支持的文件类型
 SUPPORTED_EXTENSIONS = {
@@ -173,6 +232,65 @@ def split_documents(documents: List[Document]) -> List[Document]:
     return split_docs
 
 
+def link_entities_to_chunks(
+    documents: List[Document],
+    graph_path: Path,
+) -> List[Document]:
+    """
+    链接实体到文档片段
+
+    Args:
+        documents: 文档片段列表
+        graph_path: 图谱文件路径
+
+    Returns:
+        带有 entity_ids 元数据的文档片段
+    """
+    print_info("\n链接知识图谱实体...")
+
+    # 检查图谱是否存在
+    if not graph_path.exists():
+        print_warning(f"图谱文件不存在: {graph_path}")
+        print_info("跳过实体链接，继续向量化...")
+        return documents
+
+    # 加载图谱
+    print_info(f"加载知识图谱: {graph_path}")
+    graph = VocationalGraphBuilder()
+    try:
+        graph.load(str(graph_path))
+        stats = graph.get_statistics()
+        print_success(f"图谱加载成功")
+        print(f"  节点数: {stats['total_nodes']}")
+        print(f"  边数: {stats['total_edges']}")
+    except Exception as e:
+        print_error(f"图谱加载失败: {e}")
+        print_info("跳过实体链接，继续向量化...")
+        return documents
+
+    # 创建实体链接器
+    linker = ChunkEntityLinker(graph, similarity_threshold=0.85)
+
+    # 链接实体
+    print_info("正在匹配文档片段与图谱实体...")
+    linked_docs = linker.link_chunks(documents)
+
+    # 打印统计信息
+    stats = linker.get_statistics(linked_docs)
+    print_success(f"实体链接完成")
+    print(f"  有实体的片段: {stats['chunks_with_entities']}/{stats['total_chunks']} "
+          f"({stats['chunks_with_entities_ratio']:.1%})")
+    print(f"  总实体链接数: {stats['total_entity_links']}")
+    print(f"  平均每片段: {stats['avg_links_per_chunk']:.2f} 个实体")
+
+    if stats['entity_type_distribution']:
+        print(f"\n  实体类型分布:")
+        for etype, count in sorted(stats['entity_type_distribution'].items()):
+            print(f"    {etype}: {count}")
+
+    return linked_docs
+
+
 def create_vector_store(documents: List[Document], persist_dir: Path) -> Chroma:
     """创建向量存储"""
     print_info("\n初始化 Embedding 模型...")
@@ -183,15 +301,8 @@ def create_vector_store(documents: List[Document], persist_dir: Path) -> Chroma:
     print(f"  设备: {device}")
     print(f"  模型: {EMBEDDING_MODEL_NAME}")
 
-    # 使用国内镜像加速下载
-    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={'device': device},
-        encode_kwargs={'normalize_embeddings': True},
-        show_progress=True,
-    )
+    # 使用 LocalEmbeddings 从本地缓存加载
+    embeddings = LocalEmbeddings(EMBEDDING_MODEL_NAME, device=device)
 
     print_info("\n创建向量数据库...")
 
@@ -249,7 +360,7 @@ def print_statistics(documents: List[Document], vector_store: Chroma) -> None:
 
 def main():
     """主函数"""
-    print_header("RAG 职业课程生成系统 - 数据入库")
+    print_header("RAG 职业课程生成系统 - 数据入库（含图谱实体链接）")
 
     # 检查文档目录
     if not DOCS_DIR.exists():
@@ -272,16 +383,19 @@ def main():
     # 3. 切分文档
     split_docs = split_documents(documents)
 
-    # 4. 创建向量存储
-    vector_store = create_vector_store(split_docs, CHROMA_PERSIST_DIR)
+    # 4. 链接图谱实体（新增）
+    linked_docs = link_entities_to_chunks(split_docs, GRAPH_PATH)
 
-    # 5. 打印统计信息
-    print_statistics(split_docs, vector_store)
+    # 5. 创建向量存储
+    vector_store = create_vector_store(linked_docs, CHROMA_PERSIST_DIR)
+
+    # 6. 打印统计信息
+    print_statistics(linked_docs, vector_store)
 
     print_success("\n数据入库完成！")
     print(f"\n{Fore.CYAN}后续使用:{Style.RESET_ALL}")
     print(f"  向量数据库已保存至: {CHROMA_PERSIST_DIR.absolute()}")
-    print(f"  可使用 query.py 查询数据\n")
+    print(f"  可使用 python src/test_hybrid_retrieve.py 进行图谱增强检索\n")
 
 
 if __name__ == "__main__":
